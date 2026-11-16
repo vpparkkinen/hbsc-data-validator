@@ -1,0 +1,206 @@
+$schema: https://json-schema.org/draft/2020-12/schema
+title: Survey data model, schema version 1
+description: >
+  Structure of a survey data model file. Describes the shape only. Meaning of the fields, missing-value
+  handling, naming rules and validation behaviour are in SPEC.md. Cross-references (nested_in targets,
+  alias uniqueness, variables named in rules) cannot be expressed here and are checked by
+  HBSC.check_model().
+type: object
+additionalProperties: false
+required: [schema_version, variables]
+properties:
+  schema_version:
+    description: Version of this schema. Models of another version must not be read with this schema.
+    enum: [1]
+  source:
+    description: >
+      Provenance of the model as a whole, for example spss:<file name> when the model was built from a
+      reference .sav. Free text, not interpreted by the validator.
+    type: string
+  missing_default:
+    description: >
+      Missing-value specification applied to every variable that has no own `missing` field. A variable's
+      own `missing` replaces this entirely.
+    $ref: "#/$defs/missing_spec"
+  national_variant:
+    description: >
+      Naming convention for national variants of variables: a column named `<variable><separator><code>`
+      replaces the variable. Without this key no column is treated as a national variant. Meaning:
+      SPEC.md section 6.
+    type: object
+    additionalProperties: false
+    required: [separator, code]
+    properties:
+      separator:
+        description: Text between the variable name and the code. A column is split at its last occurrence.
+        type: string
+        minLength: 1
+      code:
+        description: >
+          Regular expression the whole code part (text after the last separator) must match, case-sensitive.
+          No anchors, no named groups. A valid expression is checked by HBSC.check_model().
+        type: string
+        minLength: 1
+  variables:
+    description: Variable definitions. The key is the canonical column name.
+    type: object
+    propertyNames:
+      minLength: 1
+    additionalProperties:
+      $ref: "#/$defs/variable"
+  rules:
+    description: Custom validation rules. The key is the rule name.
+    type: object
+    propertyNames:
+      minLength: 1
+    additionalProperties:
+      $ref: "#/$defs/rule"
+$defs:
+  number_or_text:
+    type: [number, string]
+  missing_spec:
+    description: Codes and ranges that mean "no answer", in addition to NaN, which is always missing.
+    type: object
+    additionalProperties: false
+    properties:
+      values:
+        description: Individual user-missing codes, for example 99.
+        type: array
+        items:
+          $ref: "#/$defs/number_or_text"
+      ranges:
+        description: Inclusive numeric ranges of user-missing codes, for example 97 to 99.
+        type: array
+        items:
+          type: object
+          additionalProperties: false
+          required: [min, max]
+          properties:
+            min: {type: number}
+            max: {type: number}
+  variable:
+    type: object
+    additionalProperties: false
+    required: [type]
+    properties:
+      type:
+        description: >
+          Storage type of the answers. integer: whole numbers only, a value such as 2.5 is a type error.
+          float: any real number. string: text. Derived from the SPSS format (F.0 gives integer).
+        enum: [integer, float, string]
+      kind:
+        description: >
+          Conceptual measurement level, independent of storage type. nominal: unordered categories.
+          ordinal: ordered categories. continuous: interval or ratio scale, regardless of storage type,
+          so integer-typed counts and whole-number measurements are continuous.
+          Only `type` decides whether decimals are legal. Initialised from the SPSS measure (scale gives
+          continuous), may be overridden by a human. The value-label check is skipped for continuous.
+        enum: [nominal, ordinal, continuous]
+      role:
+        description: >
+          Function of the variable in the dataset. Omit for ordinary survey items. id: respondent identifier.
+          weight: survey weight. design: sampling design variable. open_text: free-text answer.
+          date: date of collection or of birth.
+        enum: [id, weight, design, open_text, date]
+      required:
+        description: >
+          The variable is mandatory. The column must be present, and must not be
+          missing in every row.
+        type: boolean
+      label:
+        description: Variable label, the question or item text.
+        type: string
+      labels:
+        description: >
+          Value labels. Keys are canonical code strings (integral numbers without decimals, "1" and not
+          "1.0"), values are the label text. For nominal and ordinal variables the keys are the legal values.
+        type: object
+        additionalProperties:
+          type: string
+      range:
+        description: >
+          Legal numeric interval for continuous variables, bounds inclusive. Either bound may be omitted.
+        type: object
+        minProperties: 1
+        additionalProperties: false
+        properties:
+          min: {type: number}
+          max: {type: number}
+      missing:
+        description: Variable-specific missing-value specification. Replaces `missing_default`, no union.
+        $ref: "#/$defs/missing_spec"
+      missing_allowed:
+        description: >
+          When false, any missing value in this variable is a finding, whether NaN, blank text or a
+          missing code. Default is true.
+        type: boolean
+      unique:
+        description: When true, non-missing values must not repeat across rows (for example the pupil number).
+        type: boolean
+      nested_in:
+        description: >
+          Name of a parent variable. Each value of this variable must occur under a single value of the
+          parent (a class belongs to one school, a school to one stratum). Must name a variable of the
+          model, checked by HBSC.check_model().
+        type: string
+      source:
+        description: >
+          Where the definition comes from when it differs from the model-level `source`. Sparse. protocol:
+          the authoritative survey specification. reference: a reference data file.
+        enum: [protocol, reference]
+      note:
+        description: Free text recording a decision or a discrepancy.
+        type: string
+      aliases:
+        description: >
+          Other names this variable is known by between the two sources of the model (protocol, reference). An incoming
+          column with an alias name is reported as non-canonical. Alias names must be unique across the
+          model and not equal to any variable name, checked by HBSC.check_model().
+        type: object
+        additionalProperties:
+          type: object
+          additionalProperties: false
+          required: [source]
+          properties:
+            source:
+              description: Where the alias name is used.
+              enum: [protocol, reference]
+            note:
+              type: string
+      spss:
+        description: >
+          Raw SPSS metadata, provenance only. The validator never reads it, it reads `type` and `kind`.
+        type: object
+        additionalProperties: false
+        properties:
+          format:
+            description: SPSS print format, for example F2.0 or A20.
+            type: string
+          measure:
+            description: SPSS measurement level, nominal, ordinal or scale.
+            type: string
+  rule:
+    description: >
+      A custom validation rule evaluated over the rows of the data. Rule logic is a Python expression
+      string, a temporary choice, see SPEC.md.
+    type: object
+    additionalProperties: false
+    required: [assert]
+    properties:
+      description:
+        description: What the rule checks, in plain words.
+        type: string
+      severity:
+        description: error or warning. Default error.
+        enum: [error, warning]
+      enabled:
+        description: Disabled rules are skipped. Default true.
+        type: boolean
+      if:
+        description: >
+          Expression selecting the rows the rule applies to. Optional, all rows when omitted. Variables are
+          referenced by column name.
+        type: string
+      assert:
+        description: Expression that must be true for every selected row. A row where it is false is a violation.
+        type: string
