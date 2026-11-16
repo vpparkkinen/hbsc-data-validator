@@ -7,7 +7,7 @@ import yaml
 import numpy as np
 import pandas
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 1
 TYPES = ("integer", "float", "string")
 KINDS = ("nominal", "ordinal", "continuous")
 ROLES = ("id", "weight", "design", "open_text", "date")
@@ -15,6 +15,7 @@ SOURCES = ("protocol", "reference")
 CATEGORIES = {
     "missing_columns": "issue",
     "missing_required": "issue",
+    "duplicate_columns": "issue",
     "non_canonical_name": "issue",
     "type_mismatch": "issue",
     "out_of_range": "issue",
@@ -29,7 +30,6 @@ CATEGORIES = {
 }
 SCHEMA_FILE = Path(__file__).with_name("hbsc_model.schema.yaml")
 RULE_NAMESPACE = ("pd", "np")
-SUFFIX_RE = re.compile(r"^(?P<base>.+?)_(?P<code>[A-Za-z]{2}(?:-[A-Za-z0-9]{1,3})?)$")
 
 
 def num(x):
@@ -79,6 +79,22 @@ def normalize_missing(spec):
 
 
 class HBSC:
+    """HBSC data model: edit, save and validate data against it.
+
+    Wraps a model file (YAML) held in `data`. Provides editing
+    of variables, aliases and rules, `check_model()` for the model itself,
+    and `validate()` / `validate_file()` for data. Rules are stored and
+    checked but not evaluated yet.
+
+    Parameters
+    ----------
+    path : str or pathlib.Path
+        Model file, also the target of `save()`. A missing file gives an
+        empty model.
+    load : bool, default True
+        If false, start from an empty model and do not read `path`.
+    """
+
     def __init__(self, path, load=True):
         self.path = path
         self.data = self._load() if load else {}
@@ -87,7 +103,7 @@ class HBSC:
         self.data.setdefault("variables", {})
         self.data.setdefault("rules", {})
         if not isinstance(self.data["variables"], dict) or not isinstance(self.data["rules"], dict):
-            raise ValueError("variables and rules must be mappings keyed by name (schema v3)")
+            raise ValueError("variables and rules must be mappings keyed by name")
 
     def _load(self):
         try:
@@ -107,6 +123,29 @@ class HBSC:
 
     def set_missing_default(self, spec):
         self.data["missing_default"] = normalize_missing(spec)
+
+    def set_national_variant(self, separator=None, code=None):
+        """Set or clear the naming convention for national variants of variables.
+
+        Parameters
+        ----------
+        separator : str, optional
+            Text between the variable name and the code. Give both
+            arguments, or neither to remove the convention.
+        code : str, optional
+            Regular expression the whole code part must match, case-sensitive.
+            Written without anchors or named groups.
+        """
+        if separator is None and code is None:
+            self.data.pop("national_variant", None)
+            return
+        if not isinstance(separator, str) or not separator or not isinstance(code, str) or not code:
+            raise ValueError("separator and code must both be non-empty strings")
+        try:
+            re.compile(code)
+        except re.error as e:
+            raise ValueError(f"code is not a valid regular expression: {e}")
+        self.data["national_variant"] = {"separator": separator, "code": code}
 
     # VARIABLES
 
@@ -240,19 +279,75 @@ class HBSC:
     def _violations(bad, numeric=False):
         return [{"row": int(idx), "value": plain(value, numeric)} for idx, value in bad.items()]
 
+    def split_variant(self, column):
+        spec = self.data.get("national_variant")
+        if not isinstance(spec, dict):
+            return None
+        separator, pattern = spec.get("separator"), spec.get("code")
+        if not isinstance(separator, str) or not separator or not isinstance(pattern, str):
+            return None
+        base, found, code = str(column).rpartition(separator)
+        if not found or not base:
+            return None
+        try:
+            if not re.fullmatch(pattern, code):
+                return None
+        except re.error:
+            return None
+        return base, code
+
     def deviation_of(self, column, country=None):
-        m = SUFFIX_RE.match(str(column))
-        if not m or m.group("base") not in self.data["variables"]:
+        split = self.split_variant(column)
+        if not split or split[0] not in self.data["variables"]:
             return None
-        code = m.group("code").upper()
-        if country is not None and code != str(country).upper():
+        base, code = split
+        if country is not None and code.upper() != str(country).upper():
             return None
-        return m.group("base"), code
+        return base, code
 
     def validate_dataframe(self, df, country=None, documented=None):
+        """Check a dataframe against the model and collect findings.
+
+        Never mutates the input and never raises for problems in the data:
+        every mismatch between df and a model is recorded as a finding, 
+        grouped by issue type.
+        Missing values (NaN and user-missing codes) are skipped by the type,
+        range and value-label checks. A duplicated column name is reported
+        and its values are not checked. Use `validate()` for the standard
+        result with an `ok` flag.
+
+        Parameters
+        ----------
+        df : pandas.DataFrame
+            Data to check.
+        country : str, optional
+            ISO 3166 code, case-insensitive. Restricts which
+            column name suffixes count as national deviations.
+        documented : list of str, optional
+            Names of columns with expected and already documented deviations.
+            Names not found in `df` become `documented_not_found`.
+
+        Returns
+        -------
+        dict
+            Issue type to list of findings, with every issue type present
+            (empty list if no findings). Entries are variable or column
+            names for `missing_columns`, `missing_required`,
+            `duplicate_columns`, `unknown_columns` and `documented_not_found`,
+            and dicts for the others. `file_error` is always empty here, it
+            is only filled by `validate_file()`. For entry fields and issue
+            categories (`issue`, `deviation`, `note`) see SPEC.md section 8.
+
+        See Also
+        --------
+        validate : Wraps this with `ok` and `country`.
+        validate_file : Loads a .sav or .csv file first.
+        """
+
         issues = {
             "missing_columns": [],
             "missing_required": [],
+            "duplicate_columns": [],
             "non_canonical_name": [],
             "unknown_columns": [],
             "documented_not_found": [],
@@ -271,7 +366,9 @@ class HBSC:
         aliases = self.alias_map()
         canonical_folded = {n.casefold(): n for n in variables}
         deviation_bases = set()
-        for col in df.columns:
+        issues["duplicate_columns"] = list(dict.fromkeys(df.columns[df.columns.duplicated()]))
+        dup_cols = set(issues["duplicate_columns"])
+        for col in dict.fromkeys(df.columns):
             if col in variables:
                 continue
             deviation = self.deviation_of(col, country)
@@ -301,6 +398,8 @@ class HBSC:
             if name not in df.columns:
                 if var.get("required") and name not in deviation_bases:
                     issues["missing_columns"].append(name)
+                continue
+            if name in dup_cols:
                 continue
 
             series = df[name]
@@ -334,7 +433,7 @@ class HBSC:
                     })
 
             parent = var.get("nested_in")
-            if parent and parent in variables and parent in df.columns:
+            if parent and parent in variables and parent in df.columns and parent not in dup_cols:
                 pmiss = self.missing_mask(df[parent], variables[parent])
                 both = ~miss & ~pmiss
                 child = df.loc[both, name].map(label_key)
@@ -419,7 +518,38 @@ class HBSC:
         return issues
 
     def validate(self, df, country=None, documented=None):
-        issues = self.validate_dataframe(df, country=country, documented=documented)
+        """Check a dataframe against the model and return the standard result.
+
+        Runs `validate_dataframe()` and adds an overall `ok` flag. Never
+        mutates the input and never raises for problems in the data. `ok` is
+        true when there are no findings in the category `issue`. Findings in
+        the categories `deviation` and `note` do not affect it.
+
+        Parameters
+        ----------
+        df : pandas.DataFrame
+            Data to check.
+        country : str, optional
+            ISO 3166 code of the submitter, case-insensitive. Restricts which
+            column name suffixes count as national deviations.
+        documented : list of str, optional
+            Names of columns with expected and already documented deviations.
+            Names not found in `df` become `documented_not_found`.
+
+        Returns
+        -------
+        dict
+            ``{"ok": bool, "country": country as given, "issues": {...}}``.
+            `issues` is the mapping from `validate_dataframe()`: issue type to
+            list of findings, every type present. Entry fields and issue
+            categories: SPEC.md section 8.
+
+        See Also
+        --------
+        validate_dataframe : The checks, without `ok`.
+        validate_file : Loads a .sav or .csv file first, adds `file`.
+        """
+        issues =self.validate_dataframe(df, country=country, documented=documented)
         return {
             "ok": not any(v for k, v in issues.items() if CATEGORIES.get(k, "issue") == "issue"),
             "country": country,
@@ -440,6 +570,48 @@ class HBSC:
         raise ValueError(f"unsupported file type '{suffix}' (expected .sav, .zsav or .csv)")
 
     def validate_file(self, path, country=None, documented=None, **read_kwargs):
+        """Load a .sav or .csv file and check it against the model.
+
+        Reads the file with `load_file()` and passes the data to `validate()`.
+        A file that cannot be read (missing, unsupported type, parse error,
+        bad `read_kwargs`) is reported as a `file_error` finding and no other
+        checks run. Never raises for problems in the file.
+
+        Parameters
+        ----------
+        path : str or pathlib.Path
+            File to check. `.sav` and `.zsav` are read with pyreadstat with
+            user-missing codes kept (`user_missing=True`). `.csv` and `.txt`
+            are read as text without type conversion, separator detected,
+            UTF-8.
+        country : str, optional
+            ISO 3166 code of the submitter, case-insensitive. Restricts which
+            column name suffixes count as national deviations.
+        documented : list of str, optional
+            Names of columns with expected and already documented deviations.
+            Names not found in the data become `documented_not_found`.
+        **read_kwargs
+            Passed on to `pyreadstat.read_sav` or `pandas.read_csv`. For CSV
+            they override the defaults above.
+
+        Returns
+        -------
+        dict
+            The result of `validate()` plus ``"file"``, the file name without
+            its directory. On a read failure ``ok`` is false and ``issues``
+            holds only a `file_error` entry ``{"path", "message"}``, every
+            other issue type empty.
+
+        Notes
+        -----
+        Row numbers in findings start at 0 for the first data row. For CSV
+        the spreadsheet row is that number plus 2.
+
+        See Also
+        --------
+        load_file : The reader alone.
+        validate : Check a dataframe already in memory.
+        """
         try:
             df = self.load_file(path, **read_kwargs)
         except Exception as e:
@@ -482,6 +654,13 @@ class HBSC:
         if isinstance(self.data.get("missing_default"), dict):
             check_ranges(["missing_default"], self.data["missing_default"])
 
+        nv = self.data.get("national_variant")
+        if isinstance(nv, dict) and isinstance(nv.get("code"), str):
+            try:
+                re.compile(nv["code"])
+            except re.error as e:
+                add("reference_error", ["national_variant", "code"], f"not a valid regular expression: {e}")
+
         owners = {}
         for name, var in variables.items():
             where = ["variables", name]
@@ -522,10 +701,10 @@ class HBSC:
                     if label_key(key) != key:
                         add("reference_error", where + ["labels", key],
                             f"label key is not canonical, expected '{label_key(key)}'")
-            m = SUFFIX_RE.match(str(name))
-            if m and m.group("base") in variables:
+            split = self.split_variant(name)
+            if split and split[0] in variables:
                 add("name_clash", where,
-                    f"name reads as national deviation _{m.group('code').upper()} of '{m.group('base')}'")
+                    f"name reads as national variant '{split[1]}' of '{split[0]}'")
 
         for name, rule in rules.items():
             for field in ("if", "assert"):
